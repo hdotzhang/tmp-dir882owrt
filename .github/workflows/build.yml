@@ -30,6 +30,14 @@ jobs:
         run: |
           git clone --depth 1 -b v24.10.7 https://github.com/openwrt/openwrt.git owrt
 
+      - name: Add pinned AmneziaWG v2 package sources
+        run: |
+          git clone --depth 1 --branch v24.10.7 https://github.com/Slava-Shchipunov/awg-openwrt.git awg
+          test "$(git -C awg rev-parse HEAD)" = "d95099d6f4d8c4ec8eaea8d9896136b0c6bfa6cc"
+          cp -a awg/kmod-amneziawg owrt/package/
+          cp -a awg/amneziawg-tools owrt/package/
+          cp -a awg/luci-proto-amneziawg owrt/package/
+
       - name: Patch dir-882-a1 to use lzma-loader
         run: |
           cd owrt
@@ -80,6 +88,12 @@ jobs:
           CONFIG_TARGET_ramips_mt7621_DEVICE_dlink_dir-882-a1=y
           CONFIG_TARGET_ROOTFS_INITRAMFS=y
           CONFIG_PACKAGE_luci=y
+          # File transfer for modern scp clients (SFTP over the existing Dropbear SSH server)
+          CONFIG_PACKAGE_openssh-sftp-server=y
+          # AmneziaWG v2, built with this firmware so the kernel ABI matches
+          CONFIG_PACKAGE_kmod-amneziawg=y
+          CONFIG_PACKAGE_amneziawg-tools=y
+          CONFIG_PACKAGE_luci-proto-amneziawg=y
           CONFIG_CCACHE=y
           # --- trims (remove unused -> leaner squashfs) ---
           # luci over plain HTTP only (no SSL/TLS UI); i18n stays English-only (no extra lang packs are default)
