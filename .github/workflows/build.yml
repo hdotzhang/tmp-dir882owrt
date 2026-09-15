@@ -38,6 +38,18 @@ jobs:
           cp -a awg/amneziawg-tools owrt/package/
           cp -a awg/luci-proto-amneziawg owrt/package/
 
+      - name: Use generic ChaCha20 and Poly1305 kernel libraries on MT7621
+        run: |
+          cd owrt
+          f=package/kernel/linux/modules/crypto.mk
+          # OpenWrt 24.10.7 expects optional MIPS acceleration modules here,
+          # but this configuration produces the generic library modules instead.
+          # Keep the crypto packages and omit only the architecture overrides.
+          sed -i '/define KernelPackage\/crypto-lib-chacha20\/mips32r2/,/^endif$/d' "$f"
+          sed -i '/define KernelPackage\/crypto-lib-poly1305\/mips$/,/^KernelPackage\/crypto-lib-poly1305\/mips64el=/d' "$f"
+          ! grep -q 'chacha-mips.ko' "$f"
+          ! grep -q 'poly1305-mips.ko' "$f"
+
       - name: Patch dir-882-a1 to use lzma-loader
         run: |
           cd owrt
