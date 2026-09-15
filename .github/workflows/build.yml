@@ -166,57 +166,9 @@ jobs:
           kconfig=$(find build_dir/target-mipsel_24kc_musl/linux-ramips_mt7621 -path '*/linux-6.6.141/.config' -print -quit)
           test -n "$kconfig"
           grep -E '^(CONFIG_IPV6|CONFIG_NET_UDP_TUNNEL|CONFIG_CRYPTO_KPP|CONFIG_CRYPTO_LIB_CHACHA20POLY1305|CONFIG_CRYPTO_LIB_CURVE25519)=' "$kconfig"
-          grep -Eq '^CONFIG_NET_UDP_TUNNEL=[my]
-      - name: Collect images
-        run: |
-          cd owrt
-          mkdir -p ../out
-          cp -v bin/targets/ramips/mt7621/*dir-882-a1*initramfs*.bin ../out/ || true
-          cp -v bin/targets/ramips/mt7621/*dir-882-a1*sysupgrade.bin ../out/ || true
-          echo "==== artifacts ===="
-          ls -la ../out
-
-      - name: Upload images
-        uses: actions/upload-artifact@v4
-        with:
-          name: dir882-padfix-0x50000
-          path: out/*
-          if-no-files-found: error
- "$kconfig"
-          grep -Eq '^CONFIG_CRYPTO_LIB_CHACHA20POLY1305=[my]
-      - name: Collect images
-        run: |
-          cd owrt
-          mkdir -p ../out
-          cp -v bin/targets/ramips/mt7621/*dir-882-a1*initramfs*.bin ../out/ || true
-          cp -v bin/targets/ramips/mt7621/*dir-882-a1*sysupgrade.bin ../out/ || true
-          echo "==== artifacts ===="
-          ls -la ../out
-
-      - name: Upload images
-        uses: actions/upload-artifact@v4
-        with:
-          name: dir882-padfix-0x50000
-          path: out/*
-          if-no-files-found: error
- "$kconfig"
-          grep -Eq '^CONFIG_CRYPTO_LIB_CURVE25519=[my]
-      - name: Collect images
-        run: |
-          cd owrt
-          mkdir -p ../out
-          cp -v bin/targets/ramips/mt7621/*dir-882-a1*initramfs*.bin ../out/ || true
-          cp -v bin/targets/ramips/mt7621/*dir-882-a1*sysupgrade.bin ../out/ || true
-          echo "==== artifacts ===="
-          ls -la ../out
-
-      - name: Upload images
-        uses: actions/upload-artifact@v4
-        with:
-          name: dir882-padfix-0x50000
-          path: out/*
-          if-no-files-found: error
- "$kconfig"
+          grep -Eq '^CONFIG_NET_UDP_TUNNEL=[my]$' "$kconfig"
+          grep -Eq '^CONFIG_CRYPTO_LIB_CHACHA20POLY1305=[my]$' "$kconfig"
+          grep -Eq '^CONFIG_CRYPTO_LIB_CURVE25519=[my]$' "$kconfig"
 
       - name: Build
         run: |
