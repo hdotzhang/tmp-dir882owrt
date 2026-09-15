@@ -38,18 +38,6 @@ jobs:
           cp -a awg/amneziawg-tools owrt/package/
           cp -a awg/luci-proto-amneziawg owrt/package/
 
-      - name: Use generic ChaCha20 and Poly1305 kernel libraries on MT7621
-        run: |
-          cd owrt
-          f=package/kernel/linux/modules/crypto.mk
-          # OpenWrt 24.10.7 expects optional MIPS acceleration modules here,
-          # but this configuration produces the generic library modules instead.
-          # Keep the crypto packages and omit only the architecture overrides.
-          sed -i '/define KernelPackage\/crypto-lib-chacha20\/mips32r2/,/^endif$/d' "$f"
-          sed -i '/define KernelPackage\/crypto-lib-poly1305\/mips$/,/^KernelPackage\/crypto-lib-poly1305\/mips64el=/d' "$f"
-          ! grep -q 'chacha-mips.ko' "$f"
-          ! grep -q 'poly1305-mips.ko' "$f"
-
       - name: Patch dir-882-a1 to use lzma-loader
         run: |
           cd owrt
@@ -113,6 +101,9 @@ jobs:
           CONFIG_PACKAGE_kmod-crypto-lib-poly1305=y
           CONFIG_PACKAGE_kmod-crypto-lib-chacha20poly1305=y
           CONFIG_PACKAGE_kmod-crypto-lib-curve25519=y
+          # Build WireGuard only to activate Linux's tunnel and MIPS crypto selections.
+          # Keep m: AWG uses the shared helpers, not wireguard.ko at runtime.
+          CONFIG_PACKAGE_kmod-wireguard=m
           CONFIG_PACKAGE_kmod-amneziawg=y
           CONFIG_PACKAGE_amneziawg-tools=y
           CONFIG_PACKAGE_luci-proto-amneziawg=y
@@ -137,6 +128,11 @@ jobs:
           # CONFIG_PACKAGE_odhcp6c is not set
           EOF
           make defconfig
+          grep -qx 'CONFIG_PACKAGE_kmod-wireguard=m' .config
+          for package in kmod-amneziawg amneziawg-tools luci-proto-amneziawg kmod-udptunnel4 kmod-udptunnel6; do
+            grep -qx "CONFIG_PACKAGE_${package}=y" .config
+          done
+          git diff --exit-code -- package/kernel/linux/modules/crypto.mk
 
       - name: Cache downloads (dl/)
         uses: actions/cache@v4
@@ -162,22 +158,87 @@ jobs:
       - name: Build
         run: |
           cd owrt
-          if ! make -j$(nproc); then
-            echo "==== final AWG-related kernel configuration ===="
-            kconfig=$(find build_dir/target-mipsel_24kc_musl/linux-ramips_mt7621 -path '*/linux-6.6.141/.config' -print -quit)
-            test -n "$kconfig"
-            grep -E '^(CONFIG_IPV6|CONFIG_NET_UDP_TUNNEL|CONFIG_CRYPTO_KPP|CONFIG_CRYPTO_LIB_CHACHA|CONFIG_CRYPTO_LIB_CHACHA20POLY1305|CONFIG_CRYPTO_LIB_POLY1305|CONFIG_CRYPTO_LIB_CURVE25519)=' "$kconfig" || true
-            make -j1 V=s
+          make -j$(nproc) || make -j1 V=s
+
+      - name: Verify kernel dependencies and firmware contents
+        run: |
+          cd owrt
+          kernel_dir=build_dir/target-mipsel_24kc_musl/linux-ramips_mt7621/linux-6.6.141
+          test -f "$kernel_dir/.config"
+          for option in WIREGUARD NET_UDP_TUNNEL CRYPTO_CHACHA_MIPS CRYPTO_POLY1305_MIPS CRYPTO_LIB_CHACHA20POLY1305 CRYPTO_LIB_CURVE25519; do
+            grep -E "^CONFIG_${option}=[my]$" "$kernel_dir/.config"
+          done
+          for symbol in udp_sock_create4 udp_sock_create6 udp_tunnel6_xmit_skb udp_tunnel_sock_release setup_udp_tunnel_sock udp_tunnel_xmit_skb; do
+            awk -v symbol="$symbol" '$2 == symbol { found=1; print } END { exit !found }' "$kernel_dir/Module.symvers"
+          done
+          target_dir=bin/targets/ramips/mt7621
+          set -- "$target_dir"/*dir-882-a1*.manifest
+          test "$#" -eq 1
+          manifest="$1"
+          test -s "$manifest"
+          for package in kmod-amneziawg amneziawg-tools luci-proto-amneziawg kmod-udptunnel4 kmod-udptunnel6; do
+            grep -E "^${package} - " "$manifest"
+          done
+          if grep -q '^kmod-wireguard - ' "$manifest"; then
+            echo "Unexpected WireGuard package in firmware" >&2
+            exit 1
           fi
+          set -- "$target_dir"/*dir-882-a1*sysupgrade.bin
+          test "$#" -eq 1
+          image="$1"
+          test -s "$image"
+          # ramips NOR sysupgrade is a raw kernel + SquashFS image, not a tar archive.
+          mkdir -p ../verification
+          python3 - "$image" > ../verification/offsets <<'PY'
+          import sys
+          data = open(sys.argv[1], "rb").read()
+          offset = data.find(b"hsqs")
+          while offset >= 0:
+              print(offset)
+              offset = data.find(b"hsqs", offset + 1)
+          PY
+          root_offset=
+          while read -r offset; do
+            if staging_dir/host/bin/unsquashfs -s -o "$offset" "$image" >/dev/null 2>&1; then
+              root_offset="$offset"
+              break
+            fi
+          done < ../verification/offsets
+          test -n "$root_offset"
+          # Extract only files needed for validation; device nodes are unnecessary.
+          staging_dir/host/bin/unsquashfs -o "$root_offset" -d ../verification/root "$image" usr/bin/awg lib/netifd/proto/amneziawg.sh lib/modules
+          test -x ../verification/root/usr/bin/awg
+          test -f ../verification/root/lib/netifd/proto/amneziawg.sh
+          for module in amneziawg udp_tunnel ip6_udp_tunnel chacha-mips poly1305-mips; do
+            test -f "../verification/root/lib/modules/6.6.141/${module}.ko"
+          done
+          test ! -e ../verification/root/lib/modules/6.6.141/wireguard.ko
+          echo "Verified AWG and shared modules in image; WireGuard excluded."
 
       - name: Collect images
         run: |
           cd owrt
           mkdir -p ../out
-          cp -v bin/targets/ramips/mt7621/*dir-882-a1*initramfs*.bin ../out/ || true
-          cp -v bin/targets/ramips/mt7621/*dir-882-a1*sysupgrade.bin ../out/ || true
-          echo "==== artifacts ===="
-          ls -la ../out
+          cp -v bin/targets/ramips/mt7621/*dir-882-a1*initramfs*.bin ../out/
+          cp -v bin/targets/ramips/mt7621/*dir-882-a1*sysupgrade.bin ../out/
+          cp -v bin/targets/ramips/mt7621/*dir-882-a1*.manifest ../out/
+          cp .config ../out/openwrt.config
+          cp build_dir/target-mipsel_24kc_musl/linux-ramips_mt7621/linux-6.6.141/.config ../out/kernel.config
+          cd ../out
+          sha256sum *.bin > SHA256SUMS
+          ls -lh
+
+      - name: Save build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dir882-build-diagnostics
+          include-hidden-files: true
+          path: |
+            owrt/.config
+            owrt/build_dir/target-mipsel_24kc_musl/linux-ramips_mt7621/linux-6.6.141/.config*
+            owrt/build_dir/target-mipsel_24kc_musl/linux-ramips_mt7621/linux-6.6.141/Module.symvers
+          if-no-files-found: warn
 
       - name: Upload images
         uses: actions/upload-artifact@v4
