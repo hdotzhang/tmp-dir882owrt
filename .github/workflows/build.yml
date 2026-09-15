@@ -8,6 +8,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
+    env:
+      KERNEL_VERSION: 6.6.141
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -24,7 +26,24 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential clang flex bison g++ gawk \
             gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
-            python3-setuptools python3-distutils rsync unzip zlib1g-dev file wget swig
+            python3-setuptools python3-distutils python3-yaml rsync unzip zlib1g-dev file wget swig
+
+      - name: Check workflow scripts before building
+        run: |
+          python3 - <<'PY'
+          import pathlib, re, subprocess, yaml
+          workflow = yaml.safe_load(pathlib.Path(".github/workflows/build.yml").read_text())
+          count = 0
+          for step in workflow["jobs"]["build"]["steps"]:
+              script = step.get("run")
+              if script is None:
+                  continue
+              subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+              for match in re.finditer(r"<<'PY'\n(.*?)\nPY(?:\n|$)", script, re.S):
+                  compile(match.group(1), step["name"], "exec")
+              count += 1
+          print(f"Validated shell syntax in {count} steps and embedded Python syntax")
+          PY
 
       - name: Clone OpenWrt v24.10.7 (pinned tag)
         run: |
@@ -134,60 +153,117 @@ jobs:
           done
           git diff --exit-code -- package/kernel/linux/modules/crypto.mk
 
-      - name: Cache downloads (dl/)
-        uses: actions/cache@v4
+      - name: Restore downloads (dl/)
+        id: download-cache
+        uses: actions/cache/restore@v4
         with:
           path: owrt/dl
           key: owrt-dl-2410-${{ hashFiles('owrt/.config') }}
           restore-keys: |
             owrt-dl-2410-
 
-      - name: Cache ccache (.ccache)
-        uses: actions/cache@v4
+      - name: Restore compiler cache (.ccache)
+        id: compiler-cache
+        uses: actions/cache/restore@v4
         with:
           path: owrt/.ccache
-          key: owrt-ccache-2410-${{ github.run_id }}
+          key: owrt-ccache-2410-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             owrt-ccache-2410-
 
       - name: Download sources
+        id: download
         run: |
           cd owrt
           make download -j8 || make download -j1 V=s
 
+      - name: Save downloaded sources
+        if: ${{ !cancelled() && steps.download.outcome == 'success' && steps.download-cache.outputs.cache-hit != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: owrt/dl
+          key: ${{ steps.download-cache.outputs.cache-primary-key }}
+
       - name: Build
+        id: build
         run: |
+          set -o pipefail
+          mkdir -p diagnostics
           cd owrt
-          make -j$(nproc) || make -j1 V=s
+          (make -j$(nproc) || make -j1 V=s) 2>&1 | tee ../diagnostics/build.log
+
+      - name: Save compiler cache after successful build
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: owrt/.ccache
+          key: ${{ steps.compiler-cache.outputs.cache-primary-key }}
+
+      - name: Collect images before verification
+        run: |
+          set -euo pipefail
+          cd owrt
+          mkdir -p ../out
+          cp -v bin/targets/ramips/mt7621/*dir-882-a1*initramfs*.bin ../out/
+          cp -v bin/targets/ramips/mt7621/*dir-882-a1*sysupgrade.bin ../out/
+          cp -v bin/targets/ramips/mt7621/*dir-882-a1*.manifest ../out/
+          cp .config ../out/openwrt.config
+          cp "build_dir/target-mipsel_24kc_musl/linux-ramips_mt7621/linux-$KERNEL_VERSION/.config" ../out/kernel.config
+          cd ../out
+          sha256sum *.bin > SHA256SUMS
+          ls -lh
+
+      - name: Preserve unverified images
+        uses: actions/upload-artifact@v4
+        with:
+          name: dir882-unverified-${{ github.run_number }}-${{ github.run_attempt }}
+          path: out/*
+          if-no-files-found: error
 
       - name: Verify kernel dependencies and firmware contents
+        id: verify
         run: |
+          set -Eeuo pipefail
+          mkdir -p diagnostics
+          exec > >(tee diagnostics/verification.log) 2>&1
+          trap 'echo "Verification failed at line $LINENO: $BASH_COMMAND" >&2' ERR
+          fail() { echo "ERROR: $*" >&2; exit 1; }
+          require_file() { test -s "$1" || fail "Missing or empty file: $1"; }
+          require_exec() { test -x "$1" || fail "Missing executable: $1"; }
           cd owrt
-          kernel_dir=build_dir/target-mipsel_24kc_musl/linux-ramips_mt7621/linux-6.6.141
-          test -f "$kernel_dir/.config"
+          kernel_dir="build_dir/target-mipsel_24kc_musl/linux-ramips_mt7621/linux-$KERNEL_VERSION"
+          squashfs_tool=staging_dir/host/bin/unsquashfs4
+          require_exec "$squashfs_tool"
+          require_file "$kernel_dir/.config"
+          require_file "$kernel_dir/Module.symvers"
           for option in WIREGUARD NET_UDP_TUNNEL CRYPTO_CHACHA_MIPS CRYPTO_POLY1305_MIPS CRYPTO_LIB_CHACHA20POLY1305 CRYPTO_LIB_CURVE25519; do
-            grep -E "^CONFIG_${option}=[my]$" "$kernel_dir/.config"
+            grep -E "^CONFIG_${option}=[my]$" "$kernel_dir/.config" || fail "Kernel option disabled: $option"
           done
           for symbol in udp_sock_create4 udp_sock_create6 udp_tunnel6_xmit_skb udp_tunnel_sock_release setup_udp_tunnel_sock udp_tunnel_xmit_skb; do
-            awk -v symbol="$symbol" '$2 == symbol { found=1; print } END { exit !found }' "$kernel_dir/Module.symvers"
+            awk -v symbol="$symbol" '$2 == symbol { found=1; print } END { exit !found }' "$kernel_dir/Module.symvers" || fail "Missing kernel export: $symbol"
           done
           target_dir=bin/targets/ramips/mt7621
-          set -- "$target_dir"/*dir-882-a1*.manifest
-          test "$#" -eq 1
-          manifest="$1"
-          test -s "$manifest"
-          for package in kmod-amneziawg amneziawg-tools luci-proto-amneziawg kmod-udptunnel4 kmod-udptunnel6; do
-            grep -E "^${package} - " "$manifest"
+          shopt -s nullglob
+          manifests=("$target_dir"/*dir-882-a1*.manifest)
+          test "${#manifests[@]}" -eq 1 || fail "Expected one DIR-882 manifest, found ${#manifests[@]}"
+          manifest="${manifests[0]}"
+          require_file "$manifest"
+          for package in kmod-amneziawg amneziawg-tools luci-proto-amneziawg kmod-udptunnel4 kmod-udptunnel6 kmod-crypto-lib-chacha20 kmod-crypto-lib-poly1305 kmod-crypto-lib-chacha20poly1305 kmod-crypto-lib-curve25519 openssh-sftp-server dropbear uhttpd; do
+            grep -E "^${package} - " "$manifest" || fail "Missing firmware package: $package"
           done
-          if grep -q '^kmod-wireguard - ' "$manifest"; then
-            echo "Unexpected WireGuard package in firmware" >&2
-            exit 1
-          fi
-          set -- "$target_dir"/*dir-882-a1*sysupgrade.bin
-          test "$#" -eq 1
-          image="$1"
-          test -s "$image"
-          # ramips NOR sysupgrade is a raw kernel + SquashFS image, not a tar archive.
+          # Retain existing LuCI protocol UI packages; check requested service/storage exclusions.
+          for package in kmod-wireguard ppp ppp-mod-pppoe kmod-ppp kmod-pppoe kmod-pppox odhcp6c odhcpd odhcpd-ipv6only kmod-usb-storage kmod-usb-storage-uas block-mount kmod-fs-ext4 kmod-fs-vfat luci-ssl; do
+            if grep -q "^${package} - " "$manifest"; then
+              fail "Unexpected firmware package: $package"
+            fi
+          done
+          images=("$target_dir"/*dir-882-a1*sysupgrade.bin)
+          test "${#images[@]}" -eq 1 || fail "Expected one sysupgrade image, found ${#images[@]}"
+          image="${images[0]}"
+          require_file "$image"
+          # ramips NOR sysupgrade is a raw kernel + SquashFS image.
           mkdir -p ../verification
           python3 - "$image" > ../verification/offsets <<'PY'
           import sys
@@ -199,34 +275,53 @@ jobs:
           PY
           root_offset=
           while read -r offset; do
-            if staging_dir/host/bin/unsquashfs -s -o "$offset" "$image" >/dev/null 2>&1; then
+            echo "Checking SquashFS candidate at byte $offset"
+            if "$squashfs_tool" -s -o "$offset" "$image"; then
               root_offset="$offset"
               break
             fi
           done < ../verification/offsets
-          test -n "$root_offset"
-          # Extract only files needed for validation; device nodes are unnecessary.
-          staging_dir/host/bin/unsquashfs -o "$root_offset" -d ../verification/root "$image" usr/bin/awg lib/netifd/proto/amneziawg.sh lib/modules
-          test -x ../verification/root/usr/bin/awg
-          test -f ../verification/root/lib/netifd/proto/amneziawg.sh
-          for module in amneziawg udp_tunnel ip6_udp_tunnel chacha-mips poly1305-mips; do
-            test -f "../verification/root/lib/modules/6.6.141/${module}.ko"
+          test -n "$root_offset" || fail "No readable SquashFS found in $image"
+          # Extract only required files, without device nodes.
+          "$squashfs_tool" -o "$root_offset" -d ../verification/root "$image" \
+            usr/bin/awg lib/netifd/proto/amneziawg.sh lib/modules \
+            usr/lib/sftp-server usr/libexec/sftp-server \
+            www/luci-static/resources/protocol/amneziawg.js etc/uci-defaults/99-set-lan-ip
+          root=../verification/root
+          require_exec "$root/usr/bin/awg"
+          require_exec "$root/lib/netifd/proto/amneziawg.sh"
+          require_exec "$root/usr/lib/sftp-server"
+          require_exec "$root/usr/libexec/sftp-server"
+          require_file "$root/www/luci-static/resources/protocol/amneziawg.js"
+          require_file "$root/etc/uci-defaults/99-set-lan-ip"
+          grep -Fq "network.lan.ipaddr='192.168.199.1'" "$root/etc/uci-defaults/99-set-lan-ip" || fail "LAN address script differs"
+          for module in amneziawg udp_tunnel ip6_udp_tunnel chacha-mips poly1305-mips libchacha20poly1305 libcurve25519 libcurve25519-generic; do
+            require_file "$root/lib/modules/$KERNEL_VERSION/${module}.ko"
           done
-          test ! -e ../verification/root/lib/modules/6.6.141/wireguard.ko
-          echo "Verified AWG and shared modules in image; WireGuard excluded."
-
-      - name: Collect images
-        run: |
-          cd owrt
-          mkdir -p ../out
-          cp -v bin/targets/ramips/mt7621/*dir-882-a1*initramfs*.bin ../out/
-          cp -v bin/targets/ramips/mt7621/*dir-882-a1*sysupgrade.bin ../out/
-          cp -v bin/targets/ramips/mt7621/*dir-882-a1*.manifest ../out/
-          cp .config ../out/openwrt.config
-          cp build_dir/target-mipsel_24kc_musl/linux-ramips_mt7621/linux-6.6.141/.config ../out/kernel.config
-          cd ../out
-          sha256sum *.bin > SHA256SUMS
-          ls -lh
+          test ! -e "$root/lib/modules/$KERNEL_VERSION/wireguard.ko" || fail "WireGuard module found in firmware"
+          # Follow AWG's actual ELF module dependencies recursively.
+          python3 - "$root/lib/modules/$KERNEL_VERSION" <<'PY'
+          import pathlib, re, subprocess, sys
+          directory = pathlib.Path(sys.argv[1])
+          modules = {p.stem.replace("-", "_"): p for p in directory.glob("*.ko")}
+          pending, checked = ["amneziawg"], set()
+          while pending:
+              name = pending.pop().replace("-", "_")
+              if name in checked:
+                  continue
+              if name not in modules:
+                  raise SystemExit(f"Missing runtime module dependency: {name}")
+              checked.add(name)
+              info = subprocess.check_output(["readelf", "-p", ".modinfo", str(modules[name])], text=True)
+              match = re.search(r"\]\s+depends=([^\r\n]*)", info)
+              if match is None:
+                  raise SystemExit(f"Missing dependency metadata: {modules[name]}")
+              dependencies = [d for d in match.group(1).strip().split(",") if d]
+              print(f"{name}: {', '.join(dependencies) or '(none)'}")
+              pending.extend(dependencies)
+          print(f"Verified {len(checked)} modules in AWG dependency chain")
+          PY
+          echo "Verified image contents; router boot and VPN operation still require runtime testing."
 
       - name: Save build diagnostics
         if: always()
@@ -235,12 +330,18 @@ jobs:
           name: dir882-build-diagnostics
           include-hidden-files: true
           path: |
+            diagnostics/
+            verification/offsets
+            out/
+            owrt/bin/targets/ramips/mt7621/*dir-882-a1*.bin
+            owrt/bin/targets/ramips/mt7621/*dir-882-a1*.manifest
             owrt/.config
-            owrt/build_dir/target-mipsel_24kc_musl/linux-ramips_mt7621/linux-6.6.141/.config*
-            owrt/build_dir/target-mipsel_24kc_musl/linux-ramips_mt7621/linux-6.6.141/Module.symvers
+            owrt/build_dir/target-mipsel_24kc_musl/linux-ramips_mt7621/linux-${{ env.KERNEL_VERSION }}/.config*
+            owrt/build_dir/target-mipsel_24kc_musl/linux-ramips_mt7621/linux-${{ env.KERNEL_VERSION }}/Module.symvers
           if-no-files-found: warn
 
-      - name: Upload images
+      - name: Upload verified images
+        if: ${{ success() && steps.verify.outcome == 'success' }}
         uses: actions/upload-artifact@v4
         with:
           name: dir882-padfix-0x50000
